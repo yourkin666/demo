@@ -56,6 +56,11 @@ class SearchRequest(BaseModel):
     top_k: int = 10
     precision_mode: bool = False
     precision_level: float = 0.8   # 0.0 ~ 1.0，对应滑块百分比
+    # 字段过滤
+    genders: Optional[List[str]] = None
+    races: Optional[List[str]] = None
+    min_age: Optional[int] = None
+    max_age: Optional[int] = None
 
 
 class SearchResult(BaseModel):
@@ -78,18 +83,36 @@ class SearchResult(BaseModel):
 class SearchResponse(BaseModel):
     results: List[SearchResult]
     total_before_filter: int          # 过滤前候选数
-    threshold: Optional[float] = None # 精准模式阈值，None 表示普通模式
+    precision_top_k: Optional[int] = None  # 精准模式实际限制的返回数量
 
 
-# 精准模式：滑块 [0,1] → 分数阈值 [0.30, 0.65]
-_THRESHOLD_MIN = 0.30
-_THRESHOLD_MAX = 0.65
+# 精准模式：滑块 [0,1] → 返回数量 [50, 1]
+_PRECISION_MAX_RESULTS = 50  # 精度 0% 时最多返回
+_PRECISION_MIN_RESULTS = 1   # 精度 100% 时最少返回（保证至少 1 条）
 
-def _precision_threshold(level: float) -> float:
-    return _THRESHOLD_MIN + level * (_THRESHOLD_MAX - _THRESHOLD_MIN)
+def _precision_top_k(level: float) -> int:
+    n = _PRECISION_MAX_RESULTS + level * (_PRECISION_MIN_RESULTS - _PRECISION_MAX_RESULTS)
+    return max(_PRECISION_MIN_RESULTS, round(n))
 
 
 FETCH_LIMIT = 200  # 每次从 Milvus 最多取回的候选数
+
+
+def _build_filter(req: "SearchRequest") -> Optional[str]:
+    """将请求中的过滤条件转成 Milvus 标量过滤表达式。"""
+    clauses: List[str] = []
+
+    def _in_clause(field: str, values: List[str]) -> str:
+        quoted = ", ".join(f'"{v}"' for v in values)
+        return f'{field} in [{quoted}]'
+
+    if req.genders:
+        clauses.append(_in_clause("gender", req.genders))
+    if req.races:
+        clauses.append(_in_clause("race", req.races))
+    # age 为字符串字段，在 Python 侧过滤，此处不加
+
+    return " and ".join(clauses) if clauses else None
 
 
 @app.post("/search", response_model=SearchResponse)
@@ -113,7 +136,9 @@ def search(req: SearchRequest) -> SearchResponse:
     else:
         search_params = {"metric_type": "IP", "params": {"ef": 64}}
 
-    raw: List[List[Dict]] = milvus_client.search(
+    filter_expr = _build_filter(req)
+
+    search_kwargs: Dict[str, Any] = dict(
         collection_name=COLLECTION,
         data=[vector],
         anns_field="dense_vector",
@@ -121,15 +146,36 @@ def search(req: SearchRequest) -> SearchResponse:
         search_params=search_params,
         output_fields=OUTPUT_FIELDS,
     )
+    if filter_expr:
+        search_kwargs["filter"] = filter_expr
+
+    raw: List[List[Dict]] = milvus_client.search(**search_kwargs)
 
     hits = raw[0]
     total_before_filter = len(hits)
-    threshold: float | None = None
+    precision_top_k: int | None = None
 
-    # 3. 精准模式：按阈值过滤，不截断数量
+    # 3. 精准模式：精度越高，返回数量越少，最少 1 条
     if req.precision_mode:
-        threshold = round(_precision_threshold(level), 4)
-        hits = [h for h in hits if float(h.get("distance", 0)) >= threshold]
+        precision_top_k = _precision_top_k(level)
+        hits = hits[:precision_top_k]
+    else:
+        hits = hits[:req.top_k]
+
+    # 3b. age 为字符串字段，Python 侧过滤
+    if req.min_age is not None or req.max_age is not None:
+        def _age_ok(hit: Dict) -> bool:
+            raw = hit.get("entity", {}).get("age")
+            try:
+                age = int(raw)
+            except (TypeError, ValueError):
+                return False
+            if req.min_age is not None and age < req.min_age:
+                return False
+            if req.max_age is not None and age > req.max_age:
+                return False
+            return True
+        hits = [h for h in hits if _age_ok(h)]
 
     # 4. 整理结果
     results: List[SearchResult] = []
@@ -152,7 +198,7 @@ def search(req: SearchRequest) -> SearchResponse:
             language=e.get("language") or "",
         ))
 
-    return SearchResponse(results=results, total_before_filter=total_before_filter, threshold=threshold)
+    return SearchResponse(results=results, total_before_filter=total_before_filter, precision_top_k=precision_top_k)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -305,6 +351,37 @@ HTML_PAGE = """<!DOCTYPE html>
                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   .empty { text-align: center; color: #999; padding: 60px 20px; font-size: 0.95rem; }
+
+  /* 过滤面板 */
+  .filter-panel { max-width: 700px; margin: 14px auto 0; padding: 0 16px; }
+  .filter-card { background: #fff; border-radius: 14px; box-shadow: 0 2px 12px rgba(0,0,0,.07); overflow: hidden; }
+  .filter-header { display: flex; align-items: center; justify-content: space-between;
+                   padding: 14px 20px; cursor: pointer; user-select: none; }
+  .filter-header-left { display: flex; align-items: center; gap: 8px; font-size: 0.95rem; font-weight: 600; color: #1a1a2e; }
+  .filter-badge { background: #667eea; color: #fff; font-size: 0.72rem; font-weight: 700;
+                  padding: 2px 8px; border-radius: 20px; display: none; }
+  .filter-badge.visible { display: inline-block; }
+  .filter-chevron { font-size: 0.8rem; color: #aaa; transition: transform .25s; }
+  .filter-chevron.open { transform: rotate(180deg); }
+  .filter-body { border-top: 1px solid #f0f0f0; padding: 16px 20px; display: none; }
+  .filter-body.open { display: block; }
+
+  .filter-row { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 14px; }
+  .filter-group { flex: 1; min-width: 140px; }
+  .filter-group label { display: block; font-size: 0.75rem; color: #aaa;
+                        text-transform: uppercase; letter-spacing: .4px; margin-bottom: 6px; }
+  .filter-group select, .filter-group input[type=number] {
+    width: 100%; padding: 7px 10px; border: 1px solid #e0e0e0; border-radius: 8px;
+    font-size: 0.85rem; color: #333; background: #fafafa; outline: none;
+    transition: border-color .2s;
+  }
+  .filter-group select:focus, .filter-group input[type=number]:focus { border-color: #667eea; }
+  .filter-group select[multiple] { height: 90px; }
+
+  .filter-actions { display: flex; justify-content: flex-end; }
+  .filter-clear { background: none; border: 1px solid #ddd; border-radius: 8px;
+                  padding: 6px 16px; font-size: 0.82rem; color: #888; cursor: pointer; transition: all .15s; }
+  .filter-clear:hover { border-color: #999; color: #555; }
 </style>
 </head>
 <body>
@@ -343,6 +420,53 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
     <div class="precision-desc" id="precisionDesc">
       精准模式使用更加严格的替代搜索算法，以带来相关性更强但数量更少的搜索结果；强度越高，分数阈值越严格，结果数量有时会低于预期。
+    </div>
+  </div>
+</div>
+
+<div class="filter-panel">
+  <div class="filter-card">
+    <div class="filter-header" onclick="toggleFilter()">
+      <div class="filter-header-left">
+        筛选条件
+        <span class="filter-badge" id="filterBadge">0</span>
+      </div>
+      <span class="filter-chevron" id="filterChevron">▼</span>
+    </div>
+    <div class="filter-body" id="filterBody">
+      <div class="filter-row">
+        <div class="filter-group">
+          <label>性别</label>
+          <select id="fGender" multiple onchange="updateFilterBadge()">
+            <option value="Woman">女</option>
+            <option value="Man">男</option>
+          </select>
+        </div>
+        <div class="filter-group">
+          <label>种族</label>
+          <select id="fRace" multiple onchange="updateFilterBadge()">
+            <option value="white">White</option>
+            <option value="black">Black</option>
+            <option value="latino">Latino</option>
+            <option value="asian">Asian</option>
+            <option value="middle eastern">Middle Eastern</option>
+            <option value="indian">Indian</option>
+          </select>
+        </div>
+        <div class="filter-group">
+          <label>最小年龄</label>
+          <input type="number" id="fMinAge" min="0" max="100"
+                 placeholder="不限" oninput="updateFilterBadge()">
+        </div>
+        <div class="filter-group">
+          <label>最大年龄</label>
+          <input type="number" id="fMaxAge" min="0" max="100"
+                 placeholder="不限" oninput="updateFilterBadge()">
+        </div>
+      </div>
+      <div class="filter-actions">
+        <button class="filter-clear" onclick="clearFilters()">清除筛选</button>
+      </div>
     </div>
   </div>
 </div>
@@ -425,6 +549,51 @@ function renderCard(r, rank) {
   </div>`;
 }
 
+function toggleFilter() {
+  document.getElementById('filterBody').classList.toggle('open');
+  document.getElementById('filterChevron').classList.toggle('open');
+}
+
+function getMultiSelect(id) {
+  const sel = document.getElementById(id);
+  const vals = Array.from(sel.selectedOptions).map(o => o.value);
+  return vals.length ? vals : null;
+}
+
+function updateFilterBadge() {
+  let count = 0;
+  if (getMultiSelect('fGender')) count++;
+  if (getMultiSelect('fRace')) count++;
+  if (document.getElementById('fMinAge').value) count++;
+  if (document.getElementById('fMaxAge').value) count++;
+  const badge = document.getElementById('filterBadge');
+  badge.textContent = count;
+  badge.classList.toggle('visible', count > 0);
+}
+
+function clearFilters() {
+  ['fGender','fRace'].forEach(id => {
+    Array.from(document.getElementById(id).options).forEach(o => o.selected = false);
+  });
+  ['fMinAge','fMaxAge'].forEach(id => {
+    document.getElementById(id).value = '';
+  });
+  updateFilterBadge();
+}
+
+function getFilters() {
+  const f = {};
+  const genders = getMultiSelect('fGender');
+  if (genders) f.genders = genders;
+  const races = getMultiSelect('fRace');
+  if (races) f.races = races;
+  const minAge = parseInt(document.getElementById('fMinAge').value);
+  if (!isNaN(minAge)) f.min_age = minAge;
+  const maxAge = parseInt(document.getElementById('fMaxAge').value);
+  if (!isNaN(maxAge)) f.max_age = maxAge;
+  return f;
+}
+
 function onToggleChange() {
   const on = document.getElementById('precisionToggle').checked;
   document.getElementById('sliderRow').classList.toggle('visible', on);
@@ -461,7 +630,7 @@ async function doSearch() {
     const res = await fetch('/search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: q, precision_mode: precisionMode, precision_level: precisionLevel }),
+      body: JSON.stringify({ query: q, precision_mode: precisionMode, precision_level: precisionLevel, ...getFilters() }),
     });
     if (!res.ok) {
       const err = await res.json();
@@ -469,11 +638,10 @@ async function doSearch() {
     }
     const data = await res.json();
     const elapsed = ((Date.now() - t0) / 1000).toFixed(2);
-    const { results, total_before_filter, threshold } = data;
+    const { results, total_before_filter, precision_top_k } = data;
     let statusText = `找到 <strong>${results.length}</strong> 条结果 · 耗时 ${elapsed}s`;
-    if (precisionMode && threshold != null) {
-      const filtered = total_before_filter - results.length;
-      statusText += ` · 精准模式已过滤 ${filtered} 条低相关结果（阈值 ${threshold}）`;
+    if (precisionMode && precision_top_k != null) {
+      statusText += ` · 精准模式限制返回 ${precision_top_k} 条（从 ${total_before_filter} 条候选中取最相关）`;
     }
     status.innerHTML = statusText;
     if (results.length === 0) {
