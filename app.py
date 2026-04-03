@@ -2,27 +2,21 @@
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from openai import OpenAI
 from pymilvus import MilvusClient
 from pydantic import BaseModel
 
-# ── 环境配置 ──────────────────────────────────────────────────────────────────
+# ── 配置 ──────────────────────────────────────────────────────────────────────
 
-_env_path = Path(__file__).resolve().parents[1] / ".env.local"
-load_dotenv(_env_path if _env_path.exists() else None)
-
-MILVUS_URI      = os.environ["MILVUS_URI"]
-MILVUS_USER     = os.environ["MILVUS_USER"]
-MILVUS_PASSWORD = os.environ["MILVUS_PASSWORD"]
-OPENAI_API_KEY  = os.getenv("AIHUBMIX_API_KEY") or os.environ["OPENAI_API_KEY"]
-OPENAI_BASE_URL = "https://aihubmix.com/v1"   # OpenAI-compatible 嵌入接口
+MILVUS_URI      = "https://in01-8e7a04dd78ea0f3.gcp-us-west1.vectordb.zillizcloud.com:443"
+MILVUS_USER     = "db_4751ecda463a927"
+MILVUS_PASSWORD = "ctd5bap-MCQ3bat5gae"
+OPENAI_API_KEY  = "sk-vm8QkbaQ6LghH8iF25C49bEaE1C941De86FeC28aDcDd072c"
+OPENAI_BASE_URL = "https://aihubmix.com/v1"
 
 COLLECTION  = "text_demo"
 EMBED_MODEL = "text-embedding-3-large"
