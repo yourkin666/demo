@@ -53,7 +53,6 @@ def _startup() -> None:
 
 class SearchRequest(BaseModel):
     query: str
-    top_k: int = 10
     precision_mode: bool = False
     precision_level: float = 0.8   # 0.0 ~ 1.0，对应滑块百分比
     # 字段过滤
@@ -83,16 +82,6 @@ class SearchResult(BaseModel):
 class SearchResponse(BaseModel):
     results: List[SearchResult]
     total_before_filter: int          # 过滤前候选数
-    precision_top_k: Optional[int] = None  # 精准模式实际限制的返回数量
-
-
-# 精准模式：滑块 [0,1] → 返回数量 [50, 1]
-_PRECISION_MAX_RESULTS = 50  # 精度 0% 时最多返回
-_PRECISION_MIN_RESULTS = 1   # 精度 100% 时最少返回（保证至少 1 条）
-
-def _precision_top_k(level: float) -> int:
-    n = _PRECISION_MAX_RESULTS + level * (_PRECISION_MIN_RESULTS - _PRECISION_MAX_RESULTS)
-    return max(_PRECISION_MIN_RESULTS, round(n))
 
 
 FETCH_LIMIT = 200  # 每次从 Milvus 最多取回的候选数
@@ -153,14 +142,6 @@ def search(req: SearchRequest) -> SearchResponse:
 
     hits = raw[0]
     total_before_filter = len(hits)
-    precision_top_k: int | None = None
-
-    # 3. 精准模式：精度越高，返回数量越少，最少 1 条
-    if req.precision_mode:
-        precision_top_k = _precision_top_k(level)
-        hits = hits[:precision_top_k]
-    else:
-        hits = hits[:req.top_k]
 
     # 3b. age 为字符串字段，Python 侧过滤
     if req.min_age is not None or req.max_age is not None:
@@ -198,7 +179,7 @@ def search(req: SearchRequest) -> SearchResponse:
             language=e.get("language") or "",
         ))
 
-    return SearchResponse(results=results, total_before_filter=total_before_filter, precision_top_k=precision_top_k)
+    return SearchResponse(results=results, total_before_filter=total_before_filter)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -638,10 +619,10 @@ async function doSearch() {
     }
     const data = await res.json();
     const elapsed = ((Date.now() - t0) / 1000).toFixed(2);
-    const { results, total_before_filter, precision_top_k } = data;
+    const { results, total_before_filter } = data;
     let statusText = `找到 <strong>${results.length}</strong> 条结果 · 耗时 ${elapsed}s`;
-    if (precisionMode && precision_top_k != null) {
-      statusText += ` · 精准模式限制返回 ${precision_top_k} 条（从 ${total_before_filter} 条候选中取最相关）`;
+    if (precisionMode) {
+      statusText += ` · 精准模式（从 ${total_before_filter} 条候选中筛选）`;
     }
     status.innerHTML = statusText;
     if (results.length === 0) {
