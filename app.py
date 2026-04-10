@@ -53,8 +53,6 @@ def _startup() -> None:
 
 class SearchRequest(BaseModel):
     query: str
-    precision_mode: bool = False
-    precision_level: float = 0.8   # 0.0 ~ 1.0，对应滑块百分比
     # 字段过滤
     genders: Optional[List[str]] = None
     races: Optional[List[str]] = None
@@ -84,7 +82,8 @@ class SearchResponse(BaseModel):
     total_before_filter: int          # 过滤前候选数
 
 
-FETCH_LIMIT = 200  # 每次从 Milvus 最多取回的候选数
+FETCH_LIMIT = 16384  # 每次从 Milvus 最多取回的候选数
+MIN_SCORE   = 0.35   # 最低相似度门槛
 
 
 def _build_filter(req: "SearchRequest") -> Optional[str]:
@@ -108,7 +107,6 @@ def _build_filter(req: "SearchRequest") -> Optional[str]:
 def search(req: SearchRequest) -> SearchResponse:
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="query 不能为空")
-    level = max(0.0, min(1.0, req.precision_level))
 
     # 1. 嵌入查询文本
     text = req.query.strip().replace("\n", " ")
@@ -120,10 +118,7 @@ def search(req: SearchRequest) -> SearchResponse:
     vector = resp.data[0].embedding
 
     # 2. Milvus 搜索（始终取最大候选量）
-    if req.precision_mode:
-        search_params = {"metric_type": "IP", "params": {"ef": 512}}
-    else:
-        search_params = {"metric_type": "IP", "params": {"ef": 64}}
+    search_params = {"metric_type": "IP", "params": {"ef": 64}}
 
     filter_expr = _build_filter(req)
 
@@ -141,6 +136,7 @@ def search(req: SearchRequest) -> SearchResponse:
     raw: List[List[Dict]] = milvus_client.search(**search_kwargs)
 
     hits = raw[0]
+    hits = [h for h in hits if float(h.get("distance", 0)) >= MIN_SCORE]
     total_before_filter = len(hits)
 
     # 3b. age 为字符串字段，Python 侧过滤
@@ -228,45 +224,6 @@ HTML_PAGE = """<!DOCTYPE html>
   .options label { display: flex; align-items: center; gap: 6px; }
   .options select { padding: 4px 8px; border-radius: 6px; border: 1px solid #ddd;
                     font-size: 0.85rem; }
-
-  /* 精准模式面板 */
-  .precision-panel { max-width: 700px; margin: 14px auto 0; padding: 0 16px; }
-  .precision-card { background: #fff; border-radius: 14px; padding: 16px 20px;
-                    box-shadow: 0 2px 12px rgba(0,0,0,.07); }
-  .precision-header { display: flex; align-items: center; justify-content: space-between; }
-  .precision-title { font-size: 0.95rem; font-weight: 600; color: #1a1a2e; display: flex; align-items: center; gap: 10px; }
-  .precision-intensity { font-size: 0.9rem; font-weight: 400; color: #667eea; }
-
-  /* Toggle 开关 */
-  .toggle { position: relative; width: 44px; height: 24px; flex-shrink: 0; }
-  .toggle input { opacity: 0; width: 0; height: 0; }
-  .toggle-track { position: absolute; inset: 0; background: #ddd; border-radius: 24px;
-                  cursor: pointer; transition: background .25s; }
-  .toggle input:checked + .toggle-track { background: #4caf50; }
-  .toggle-thumb { position: absolute; top: 3px; left: 3px; width: 18px; height: 18px;
-                  background: #fff; border-radius: 50%; box-shadow: 0 1px 3px rgba(0,0,0,.25);
-                  transition: transform .25s; pointer-events: none; }
-  .toggle input:checked ~ .toggle-thumb { transform: translateX(20px); }
-
-  /* 滑块区域 */
-  .precision-slider-row { margin-top: 14px; display: none; }
-  .precision-slider-row.visible { display: block; }
-  .slider-wrap { position: relative; height: 24px; display: flex; align-items: center; }
-  input[type=range].pslider {
-    -webkit-appearance: none; appearance: none;
-    width: 100%; height: 4px; border-radius: 4px; outline: none; cursor: pointer;
-    background: linear-gradient(to right, #4caf50 var(--pct, 80%), #e0e0e0 var(--pct, 80%));
-  }
-  input[type=range].pslider::-webkit-slider-thumb {
-    -webkit-appearance: none; appearance: none;
-    width: 18px; height: 18px; border-radius: 50%;
-    background: #4caf50; box-shadow: 0 1px 4px rgba(0,0,0,.25); cursor: pointer;
-  }
-
-  /* 说明文字 */
-  .precision-desc { margin-top: 14px; font-size: 0.82rem; color: #666; line-height: 1.6;
-                    display: none; padding-top: 12px; border-top: 1px solid #f0f0f0; }
-  .precision-desc.visible { display: block; }
 
   .suggestions { max-width: 700px; margin: 16px auto 0; padding: 0 16px; }
   .suggestions-title { font-size: 0.75rem; color: #aaa; margin-bottom: 8px;
@@ -380,31 +337,6 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 </div>
 
-<div class="precision-panel">
-  <div class="precision-card">
-    <div class="precision-header">
-      <div class="precision-title">
-        精准模式：<span class="precision-intensity" id="intensityLabel">强度 80%</span>
-      </div>
-      <label class="toggle">
-        <input type="checkbox" id="precisionToggle" onchange="onToggleChange()">
-        <div class="toggle-track"></div>
-        <div class="toggle-thumb"></div>
-      </label>
-    </div>
-    <div class="precision-slider-row" id="sliderRow">
-      <div class="slider-wrap">
-        <input type="range" class="pslider" id="precisionSlider"
-               min="0" max="100" value="80"
-               oninput="onSliderInput(this.value)">
-      </div>
-    </div>
-    <div class="precision-desc" id="precisionDesc">
-      精准模式使用更加严格的替代搜索算法，以带来相关性更强但数量更少的搜索结果；强度越高，分数阈值越严格，结果数量有时会低于预期。
-    </div>
-  </div>
-</div>
-
 <div class="filter-panel">
   <div class="filter-card">
     <div class="filter-header" onclick="toggleFilter()">
@@ -455,24 +387,25 @@ HTML_PAGE = """<!DOCTYPE html>
 <div class="suggestions">
   <div class="suggestions-title">热门方向</div>
   <div class="chips">
-    <span class="chip chip-lifestyle"  onclick="fillSearch('lifestyle vlogging and personal daily life content')">日常生活</span>
-    <span class="chip chip-beauty"     onclick="fillSearch('beauty skincare and makeup tutorials targeting young women')">美妆护肤</span>
-    <span class="chip chip-beauty"     onclick="fillSearch('fashion styling and personal aesthetic content')">时尚穿搭</span>
-    <span class="chip chip-social"     onclick="fillSearch('pop culture celebrity news and entertainment commentary')">娱乐八卦</span>
-    <span class="chip chip-social"     onclick="fillSearch('social commentary and current events discussion')">社会评论</span>
-    <span class="chip chip-family"     onclick="fillSearch('motherhood parenting and family life vlogging')">母婴育儿</span>
-    <span class="chip chip-fitness"    onclick="fillSearch('fitness gym workout and bodybuilding content')">健身运动</span>
-    <span class="chip chip-fitness"    onclick="fillSearch('basketball football and sports entertainment')">体育竞技</span>
-    <span class="chip chip-travel"     onclick="fillSearch('travel experiences and destination exploration')">旅游探索</span>
-    <span class="chip chip-comedy"     onclick="fillSearch('comedy skits observational humor and stand-up')">搞笑喜剧</span>
-    <span class="chip chip-gaming"     onclick="fillSearch('gaming anime and pop culture for young audiences')">游戏动漫</span>
-    <span class="chip chip-food"       onclick="fillSearch('home cooking food reviews and recipe tutorials')">美食烹饪</span>
-    <span class="chip chip-biz"        onclick="fillSearch('international trade wholesale sourcing and B2B business')">跨境电商</span>
-    <span class="chip chip-health"     onclick="fillSearch('healthcare nursing and medical education content')">医疗健康</span>
-    <span class="chip chip-crime"      onclick="fillSearch('true crime mystery and criminal investigation storytelling')">真实犯罪</span>
-    <span class="chip chip-social"     onclick="fillSearch('political commentary and social issues discussion')">时政评论</span>
-    <span class="chip chip-lifestyle"  onclick="fillSearch('personal development self improvement and motivation')">个人成长</span>
-    <span class="chip chip-lifestyle"  onclick="fillSearch('pregnancy fertility and reproductive health journey')">孕产记录</span>
+    <span class="chip chip-health"     onclick="fillSearch('health wellness and preventive medicine through educational content and practical advice for daily well-being')">健康养生</span>
+    <span class="chip chip-beauty"     onclick="fillSearch('beauty products skincare and makeup application techniques through tutorials and product reviews for beauty enthusiasts')">美妆护肤</span>
+    <span class="chip chip-family"     onclick="fillSearch('family life parenting experiences and daily routines through relatable vlogs and humorous skits for parents and families')">家庭育儿</span>
+    <span class="chip chip-travel"     onclick="fillSearch('travel experiences destination guides and cultural exploration through personal vlogs and travel tips for adventure seekers')">旅行探索</span>
+    <span class="chip chip-fitness"    onclick="fillSearch('fitness gym workouts and personal training through motivational content and exercise demonstrations for fitness enthusiasts')">健身运动</span>
+    <span class="chip chip-comedy"     onclick="fillSearch('comedy relatable humor and observational skits through short-form videos for audiences seeking lighthearted entertainment')">搞笑幽默</span>
+    <span class="chip chip-food"       onclick="fillSearch('home cooking meal preparation and recipe demonstrations through practical cooking tips for food enthusiasts')">美食烹饪</span>
+    <span class="chip chip-beauty"     onclick="fillSearch('fashion styling outfit inspiration and personal style through daily outfit showcases and fashion tips for style enthusiasts')">时尚穿搭</span>
+    <span class="chip chip-lifestyle"  onclick="fillSearch('pet care animal behavior and heartwarming pet interactions through short videos for animal lovers and pet owners')">宠物萌宠</span>
+    <span class="chip chip-social"     onclick="fillSearch('political commentary current events and social issues through analysis and reaction videos for viewers interested in politics')">时事政治</span>
+    <span class="chip chip-family"     onclick="fillSearch('motherhood family dynamics and parenting humor through relatable vlogs for mothers and families')">母婴记录</span>
+    <span class="chip chip-gaming"     onclick="fillSearch('gaming content including gameplay highlights and esports commentary through engaging videos for gaming enthusiasts')">游戏电竞</span>
+    <span class="chip chip-health"     onclick="fillSearch('psychological insights relationship advice and emotional well-being through educational content for individuals seeking personal growth')">心理情感</span>
+    <span class="chip chip-biz"        onclick="fillSearch('personal finance budgeting and investment strategies through educational videos for individuals seeking financial literacy')">理财投资</span>
+    <span class="chip chip-lifestyle"  onclick="fillSearch('DIY crafts creative projects and handmade items through tutorials and showcases for craft enthusiasts')">DIY创意</span>
+    <span class="chip chip-social"     onclick="fillSearch('relationship dynamics dating advice and personal experiences through commentary and storytelling for individuals navigating love')">情感关系</span>
+    <span class="chip chip-biz"        onclick="fillSearch('consumer electronics tech gadgets and product reviews through unboxings and demonstrations for tech enthusiasts')">科技数码</span>
+    <span class="chip chip-lifestyle"  onclick="fillSearch('dance performances choreography and dance challenges through engaging videos for dance enthusiasts')">舞蹈表演</span>
+    <span class="chip chip-lifestyle"  onclick="fillSearch('educational content academic support and teaching strategies through instructional videos for students and educators')">教育学习</span>
   </div>
 </div>
 
@@ -575,17 +508,6 @@ function getFilters() {
   return f;
 }
 
-function onToggleChange() {
-  const on = document.getElementById('precisionToggle').checked;
-  document.getElementById('sliderRow').classList.toggle('visible', on);
-  document.getElementById('precisionDesc').classList.toggle('visible', on);
-}
-
-function onSliderInput(val) {
-  document.getElementById('intensityLabel').textContent = `强度 ${val}%`;
-  document.getElementById('precisionSlider').style.setProperty('--pct', val + '%');
-}
-
 function fillSearch(text) {
   document.getElementById('q').value = text;
   doSearch();
@@ -594,8 +516,6 @@ function fillSearch(text) {
 async function doSearch() {
   const q = document.getElementById('q').value.trim();
   if (!q) { document.getElementById('q').focus(); return; }
-  const precisionMode = document.getElementById('precisionToggle').checked;
-  const precisionLevel = parseInt(document.getElementById('precisionSlider').value) / 100;
   const btn = document.getElementById('btn');
   const status = document.getElementById('status');
   const grid = document.getElementById('grid');
@@ -611,7 +531,7 @@ async function doSearch() {
     const res = await fetch('/search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: q, precision_mode: precisionMode, precision_level: precisionLevel, ...getFilters() }),
+      body: JSON.stringify({ query: q, ...getFilters() }),
     });
     if (!res.ok) {
       const err = await res.json();
@@ -619,14 +539,10 @@ async function doSearch() {
     }
     const data = await res.json();
     const elapsed = ((Date.now() - t0) / 1000).toFixed(2);
-    const { results, total_before_filter } = data;
-    let statusText = `找到 <strong>${results.length}</strong> 条结果 · 耗时 ${elapsed}s`;
-    if (precisionMode) {
-      statusText += ` · 精准模式（从 ${total_before_filter} 条候选中筛选）`;
-    }
-    status.innerHTML = statusText;
+    const { results } = data;
+    status.innerHTML = `找到 <strong>${results.length}</strong> 条结果 · 耗时 ${elapsed}s`;
     if (results.length === 0) {
-      grid.innerHTML = '<div class="empty">暂无匹配结果，可降低精准模式强度后重试</div>';
+      grid.innerHTML = '<div class="empty">暂无匹配结果</div>';
     } else {
       grid.innerHTML = results.map((r, i) => renderCard(r, i + 1)).join('');
     }
