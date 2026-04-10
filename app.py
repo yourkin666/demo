@@ -86,6 +86,21 @@ FETCH_LIMIT = 16384  # 每次从 Milvus 最多取回的候选数
 MIN_SCORE   = 0.35   # 最低相似度门槛
 
 
+def _translate_to_english(text: str) -> str:
+    """如果文本含中文，调用 LLM 翻译成英文再返回；否则原文返回。"""
+    if not any('\u4e00' <= ch <= '\u9fff' for ch in text):
+        return text
+    resp = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Translate the following Chinese text to English. Return only the translated text, no explanation."},
+            {"role": "user", "content": text},
+        ],
+        temperature=0,
+    )
+    return resp.choices[0].message.content.strip()
+
+
 def _build_filter(req: "SearchRequest") -> Optional[str]:
     """将请求中的过滤条件转成 Milvus 标量过滤表达式。"""
     clauses: List[str] = []
@@ -108,8 +123,9 @@ def search(req: SearchRequest) -> SearchResponse:
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="query 不能为空")
 
-    # 1. 嵌入查询文本
+    # 1. 嵌入查询文本（中文先翻译成英文）
     text = req.query.strip().replace("\n", " ")
+    text = _translate_to_english(text)
     resp = openai_client.embeddings.create(
         model=EMBED_MODEL,
         input=text,
